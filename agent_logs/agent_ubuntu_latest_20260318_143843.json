@@ -1,0 +1,71 @@
+[
+  {
+    "timestamp": "2026-03-18T14:38:43.397730",
+    "event_type": "session_start",
+    "message": "启动容器: ubuntu:latest",
+    "data": null
+  },
+  {
+    "timestamp": "2026-03-18T14:38:52.863911",
+    "event_type": "session_started",
+    "message": "容器启动成功: b95cf564aeb7771163a7574c96756815d3f1716c60c7a1d84401bca959c7ac88",
+    "data": null
+  },
+  {
+    "timestamp": "2026-03-18T14:38:52.864858",
+    "event_type": "command_start",
+    "message": "执行命令: uname -a",
+    "data": null
+  },
+  {
+    "timestamp": "2026-03-18T14:38:52.930916",
+    "event_type": "command_completed",
+    "message": "命令执行完成",
+    "data": {
+      "exit_code": 0,
+      "output": "Linux b95cf564aeb7 6.6.87.2-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Thu Jun  5 18:30:46 UTC 2025 x86_64 x86_64 x86_64 GNU/Linux\n"
+    }
+  },
+  {
+    "timestamp": "2026-03-18T14:38:52.931801",
+    "event_type": "command_start",
+    "message": "执行命令: pwd",
+    "data": null
+  },
+  {
+    "timestamp": "2026-03-18T14:38:52.961661",
+    "event_type": "command_completed",
+    "message": "命令执行完成",
+    "data": {
+      "exit_code": 0,
+      "output": "/testbed\n"
+    }
+  },
+  {
+    "timestamp": "2026-03-18T14:38:52.962537",
+    "event_type": "command_start",
+    "message": "执行命令: echo 'test' > test.txt && cat test.txt",
+    "data": null
+  },
+  {
+    "timestamp": "2026-03-18T14:38:53.033132",
+    "event_type": "command_completed",
+    "message": "命令执行完成",
+    "data": {
+      "exit_code": 0,
+      "output": "test\n"
+    }
+  },
+  {
+    "timestamp": "2026-03-18T14:38:53.034257",
+    "event_type": "session_close",
+    "message": "关闭容器: b95cf564ae",
+    "data": null
+  },
+  {
+    "timestamp": "2026-03-18T14:38:54.274627",
+    "event_type": "session_closed",
+    "message": "容器已关闭",
+    "data": null
+  }
+]
