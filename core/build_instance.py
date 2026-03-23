@@ -1,72 +1,102 @@
 import docker
 import os
-import json
-from datasets import load_dataset
+import subprocess
+import shutil
 
 client = docker.from_env()
 
-def create_task_environment(instance):
-    """
-    完全对齐官方逻辑的构建函数：
-    instance: 数据集中的一个条目（Dict）
-    """
-    # 提取官方字段
-    instance_id = instance['instance_id']
-    repo_url = f"https://github.com/{instance['repo']}.git"
-    commit_sha = instance['base_commit']
-    problem_statement = instance['problem_statement'] # 任务书内容
+class R2EBuilder:
+    def __init__(self, repo_url, local_path):
+        self.repo_url = repo_url
+        self.repo_path = local_path
+        self._prepare_repo()
 
-    work_dir = f"temp_{instance_id}"
-    
-    # 1. 动态爬取实例代码
-    if not os.path.exists(work_dir):
-        print(f"--- [Step 1] 正在爬取仓库: {instance['repo']} ---")
-        os.system(f"git clone {repo_url} {work_dir}")
-    
-    # 切换到对应的故障发生前的 Commit
-    os.system(f"cd {work_dir} && git checkout -f {commit_sha}")
+    def _prepare_repo(self):
+        """确保本地有源码库用于扫描"""
+        if not os.path.exists(self.repo_path):
+            print(f"--- 正在克隆仓库: {self.repo_url} ---")
+            subprocess.run(["git", "clone", self.repo_url, self.repo_path], check=True)
 
-    # 2. [关键更新] 任务书注入：自动生成任务说明
-    print(f"--- [Step 2] 正在注入任务书 (Instruction) ---")
-    instruction_path = os.path.join(work_dir, "INSTRUCTION.md")
-    with open(instruction_path, "w", encoding="utf-8") as f:
-        f.write(f"# Task Instruction for {instance_id}\n\n")
-        f.write("## Problem Statement\n")
-        f.write(problem_statement)
-        f.write("\n\n## Goal\n修复上述问题，并确保所有测试通过。")
+    def find_eligible_commits(self, limit=3):
+        """匹配 R2E 逻辑：包含 fix 关键字且同时修改了源码和测试"""
+        print(f"--- 正在扫描符合条件的 Commit ---")
+        cmd = [
+            "git", "-C", self.repo_path, "log", 
+            "--grep=fix", "--grep=bug", "--grep=solve", 
+            "--pretty=format:%H", "-n", "100"
+        ]
+        all_commits = subprocess.check_output(cmd).decode().split('\n')
+        
+        eligible = []
+        for sha in all_commits:
+            if not sha: continue
+            # 检查变更文件
+            files = subprocess.check_output(["git", "-C", self.repo_path, "show", "--name-only", sha]).decode().split('\n')
+            has_src = any(f.endswith('.py') and 'test' not in f.lower() for f in files if f)
+            # 提取具体的测试文件路径，后续注入要用
+            test_files = [f for f in files if 'test' in f.lower() and f.endswith('.py')]
+            
+            if has_src and test_files:
+                eligible.append({"sha": sha, "test_files": test_files})
+                if len(eligible) >= limit: break
+        return eligible
 
-    # 3. 准备定制化的 Dockerfile
-    dockerfile_content = f"""
+    def build_pair(self, commit_info):
+        """构建 Pre-fix (故障+新测试) 和 Post-fix (修复) 镜像"""
+        sha = commit_info['sha']
+        test_files = commit_info['test_files']
+        
+        # 获取父节点 (故障点)
+        parent_sha = subprocess.check_output(["git", "-C", self.repo_path, "rev-parse", f"{sha}^"]).decode().strip()
+
+        # 1. 构建 Post-fix (修复态)
+        self._build_image(sha, "post-fix")
+
+        # 2. 构建 Pre-fix (故障态 + 注入新测试)
+        self._build_image(parent_sha, "pre-fix", inject_tests_from=sha, test_paths=test_files)
+
+    def _build_image(self, commit_sha, mode, inject_tests_from=None, test_paths=None):
+        instance_id = f"r2e-{commit_sha[:8]}-{mode}"
+        build_dir = f"temp_{instance_id}"
+        
+        if os.path.exists(build_dir): shutil.rmtree(build_dir)
+        
+        # 准备代码环境
+        subprocess.run(["git", "clone", self.repo_path, build_dir], check=True)
+        subprocess.run(["git", "-C", build_dir, "checkout", "-f", commit_sha], check=True)
+
+        # R2E 关键：如果是 pre-fix，把修复后的测试文件拉过来覆盖掉旧的（或新增）
+        if inject_tests_from and test_paths:
+            print(f"  [Inject] 正在注入测试文件到 {mode} 环境...")
+            for tp in test_paths:
+                subprocess.run(["git", "-C", build_dir, "checkout", inject_tests_from, "--", tp], check=False)
+
+        # 写入任务说明 (简单逻辑，后续可接 LLM Back-translation)
+        with open(os.path.join(build_dir, "INSTRUCTION.md"), "w") as f:
+            f.write(f"# R2E Task: {instance_id}\nMode: {mode}\nTarget Commit: {commit_sha}")
+
+        # 复用你原来的 Dockerfile 逻辑
+        dockerfile_content = f"""
 FROM swe-base-test
 COPY . /testbed
-# 确保任务书在最显眼的地方
 RUN echo 'alias hint="cat /testbed/INSTRUCTION.md"' >> ~/.bashrc
-RUN /usr/local/bin/setup_env.sh
+# 注意：如果是随机仓库，setup_env.sh 需要能处理各种依赖安装
+RUN /usr/local/bin/setup_env.sh || echo "Environment setup skipped"
 """
-    with open(os.path.join(work_dir, "Dockerfile.task"), "w") as f:
-        f.write(dockerfile_content)
+        with open(os.path.join(build_dir, "Dockerfile.task"), "w") as f:
+            f.write(dockerfile_content)
 
-    # 4. 自动化构建
-    print(f"--- [Step 3] 正在构建镜像: {instance_id} ---")
-    image, logs = client.images.build(
-        path=work_dir,
-        dockerfile="Dockerfile.task",
-        tag=f"swe-instance-{instance_id.lower().replace('.', '_')}",
-        rm=True
-    )
-    print(f"✅ 任务 {instance_id} 环境构建成功！")
-    return image
+        print(f"--- 正在构建 {mode} 镜像: {instance_id} ---")
+        client.images.build(path=build_dir, dockerfile="Dockerfile.task", tag=instance_id, rm=True)
+        print(f"✅ {instance_id} 构建成功")
 
-# --- 批量处理逻辑 ---
 if __name__ == "__main__":
-    # 1. 加载官方数据集 (以 SWE-bench Verified 为例，它是精简过的 500 个任务)
-    print("正在连接 HuggingFace 加载数据集...")
-    dataset = load_dataset("princeton-nlp/SWE-bench_Verified", split="test")
-
-    # 2. 模拟 R2E-Gym 的采样逻辑：比如我们先取前 3 个任务做实验
-    for i in range(3):
-        task_instance = dataset[i]
-        try:
-            create_task_environment(task_instance)
-        except Exception as e:
-            print(f"❌ 任务 {task_instance['instance_id']} 构建失败: {e}")
+    # 填入你想挖掘的本地路径或 URL
+    REPO_URL = "https://github.com/astropy/astropy.git"
+    LOCAL_REPO = "./astropy_source"
+    
+    builder = R2EBuilder(REPO_URL, LOCAL_REPO)
+    tasks = builder.find_eligible_commits(limit=2) # 先挖2个试试
+    
+    for task in tasks:
+        builder.build_pair(task)
