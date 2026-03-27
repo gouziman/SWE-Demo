@@ -11,7 +11,7 @@ from llm_client import TaskBackTranslator # 确保复用你现有的 LLM 模块
 # ==========================================
 # 1. 生产级配置区域
 # ==========================================
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "YOUR_GITHUB_TOKEN_HERE")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 DATA_DIR = "data"
 OUTPUT_FILE = os.path.join(DATA_DIR, "instances.jsonl")
 REGISTRY_FILE = os.path.join(DATA_DIR, "registry.json")
