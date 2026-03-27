@@ -2,223 +2,263 @@ import docker
 import os
 import subprocess
 import shutil
-import openai
-import time
-import requests  # 确保已安装: pip install requests
+import requests
+import json
+import re
+from datetime import datetime
+from llm_client import TaskBackTranslator # 确保复用你现有的 LLM 模块
 
 # ==========================================
-# 1. 密钥配置区域 (在此填写 API KEY)
+# 1. 生产级配置区域
 # ==========================================
-GITHUB_TOKEN = "YOUR_GITHUB_TOKEN_HERE"  # <--- 在此填写你的 GitHub Personal Access Token
-# LLM API 已经在 TaskBackTranslator 类中通过环境变量或参数传入，无需在此重复
-# ==========================================
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "YOUR_GITHUB_TOKEN_HERE")
+DATA_DIR = "data"
+OUTPUT_FILE = os.path.join(DATA_DIR, "instances.jsonl")
+REGISTRY_FILE = os.path.join(DATA_DIR, "registry.json")
 
-client = docker.from_env()
-
-# --- 新增：GitHub API 数据发现模块 ---
 class GitHubDiscovery:
     def __init__(self, token=None):
-        self.token = token
         self.headers = {"Authorization": f"token {token}"} if token else {}
         self.base_url = "https://api.github.com"
 
-    def get_high_quality_repos(self, lang="python", min_stars=5000, limit=5):
-        """搜索高质量（高星）项目"""
+    def get_high_quality_repos(self, lang="python", min_stars=5000, limit=3):
         print(f"--- [GitHub API] 正在搜索高质量 {lang} 项目... ---")
         url = f"{self.base_url}/search/repositories?q=language:{lang}+stars:>{min_stars}&sort=stars&order=desc&per_page={limit}"
         try:
             resp = requests.get(url, headers=self.headers).json()
             return [repo['clone_url'] for repo in resp.get('items', [])]
         except Exception as e:
-            print(f"GitHub API Error: {e}")
+            print(f"API Error: {e}")
             return []
 
-# --- 核心构建逻辑 (保持原有接口) ---
-class TaskBackTranslator:
-    def __init__(self, api_key=None, base_url=None):
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-        self.base_url = base_url or "https://api.openai.com/v1"
-        self.client = openai.OpenAI(api_key=self.api_key, base_url=self.base_url)
-
-    def generate_issue_description(self, commit_msg, diff_content):
-        if not self.api_key:
-            return "Error: API Key not set. Could not generate description."
+    def get_issue_comments(self, repo_full_name, commit_msg):
+        """精准爬取 Issue 讨论作为 hints_text"""
+        match = re.search(r'(?:Fixes|Resolves|Closes)?\s*#(\d+)', commit_msg, re.IGNORECASE)
+        if not match:
+            return ""
         
-        prompt = f"""
-你是一名资深的开源软件测试工程师。我将给你一个修复 Bug 的代码补丁（Diff）和当时的提交信息（Commit Message）。
-请你根据这些信息，反向推导并写出一个详细的 GitHub Issue 描述。
-
-要求：
-1. 站在用户的视角：描述用户在使用软件时遇到了什么异常现象或错误。
-2. 严禁直接提到补丁里的修复代码或具体的函数修改。
-3. 必须包含：【问题背景】、【复现步骤】、【预期行为】、【实际行为】。
-4. 语言：中文。
-
----
-Commit Message: {commit_msg}
----
-Code Diff:
-{diff_content[:2000]} 
----
-"""
+        issue_num = match.group(1)
+        print(f"--- [GitHub API] 探测到关联 Issue #{issue_num}，正在抓取 Hints ---")
+        url = f"{self.base_url}/repos/{repo_full_name}/issues/{issue_num}/comments"
         try:
-            response = self.client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.7
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            return f"LLM Generation Failed: {str(e)}"
+            resp = requests.get(url, headers=self.headers)
+            if resp.status_code == 200:
+                comments = resp.json()
+                return "\n\n".join([f"Comment by {c['user']['login']}:\n{c['body']}" for c in comments])
+            return ""
+        except:
+            return ""
 
 class R2EBuilder:
-    def __init__(self, repo_url, local_path):
+    def __init__(self, repo_url, local_path, github_api):
         self.repo_url = repo_url
         self.repo_path = local_path
+        self.github_api = github_api
         self.translator = TaskBackTranslator()
+        self.repo_full_name = "/".join(self.repo_url.split("/")[-2:]).replace(".git", "")
+        self.client = docker.from_env()
         self._prepare_repo()
 
     def _prepare_repo(self):
-        # 如果目录已存在且不为空，先清理掉，确保拉取的是最新目标
         if os.path.exists(self.repo_path):
             shutil.rmtree(self.repo_path)
-        
-        print(f"--- 正在克隆仓库: {self.repo_url} ---")
         subprocess.run(["git", "clone", "--depth", "200", self.repo_url, self.repo_path], check=True)
 
     def find_eligible_commits(self, limit=1):
-        print(f"--- 正在扫描 {self.repo_url} 符合条件的 Commit ---")
-        # 增加筛选力度：必须包含 fix/bug/patch，且限制为 python 文件
-        cmd = ["git", "-C", self.repo_path, "log", "--grep=fix", "--grep=bug", "--grep=solve", "--pretty=format:%H", "-n", "50"]
-        try:
-            all_commits = subprocess.check_output(cmd).decode().split('\n')
-        except:
-            return []
+        cmd = ["git", "-C", self.repo_path, "log", "--grep=fix", "--grep=bug", "--pretty=format:%H", "-n", "50"]
+        all_commits = subprocess.check_output(cmd).decode().split('\n')
         
         eligible = []
         for sha in all_commits:
             if not sha: continue
-            files = subprocess.check_output(["git", "-C", self.repo_path, "show", "--name-only", sha]).decode().split('\n')
-            has_src = any(f.endswith('.py') and 'test' not in f.lower() for f in files if f)
+            files = subprocess.check_output(["git", "-C", self.repo_path, "show", "--name-only", "--format=", sha]).decode().strip().split('\n')
             test_files = [f for f in files if 'test' in f.lower() and f.endswith('.py')]
+            src_files = [f for f in files if f.endswith('.py') and f not in test_files]
             
-            if has_src and test_files:
-                eligible.append({"sha": sha, "test_files": test_files})
+            if src_files and test_files:
+                eligible.append({"sha": sha, "src_files": src_files, "test_files": test_files})
                 if len(eligible) >= limit: break
         return eligible
 
     def build_pair(self, commit_info):
         sha = commit_info['sha']
         test_files = commit_info['test_files']
+        src_files = commit_info['src_files']
+        
         parent_sha = subprocess.check_output(["git", "-C", self.repo_path, "rev-parse", f"{sha}^"]).decode().strip()
+        created_at = subprocess.check_output(["git", "-C", self.repo_path, "show", "-s", "--format=%cI", sha]).decode().strip()
+        commit_msg = subprocess.check_output(["git", "-C", self.repo_path, "log", "-1", "--pretty=%B", sha]).decode('utf-8', 'ignore')
 
+        # 1. 严格分离 Patch
+        gold_patch = subprocess.check_output(["git", "-C", self.repo_path, "diff", parent_sha, sha, "--"] + src_files).decode('utf-8', 'ignore')
+        test_patch = subprocess.check_output(["git", "-C", self.repo_path, "diff", parent_sha, sha, "--"] + test_files).decode('utf-8', 'ignore')
+
+        # 2. 获取 Hints
+        hints_text = self.github_api.get_issue_comments(self.repo_full_name, commit_msg)
+
+        # 3. 探测版本号 (Heuristic)
+        try:
+            setup_content = subprocess.check_output(["git", "-C", self.repo_path, "show", f"{sha}:setup.py"], stderr=subprocess.DEVNULL).decode()
+            version_match = re.search(r'version=[\'"]([^\'"]+)[\'"]', setup_content)
+            version = version_match.group(1) if version_match else "1.0"
+        except:
+            version = "1.0"
+
+        # 4. 构建 Docker 环境
         self._build_image(sha, "post-fix")
-        self._build_image(parent_sha, "pre-fix", inject_tests_from=sha, test_paths=test_files)
+        problem_statement = self._build_image(parent_sha, "pre-fix", inject_tests_from=sha, test_paths=test_files, commit_msg=commit_msg)
 
-    def _build_image(self, commit_sha, mode, inject_tests_from=None, test_paths=None):
+        instance_id = f"{self.repo_full_name.replace('/', '__')}-{sha[:8]}"
+        
+        return {
+            "instance_id": instance_id,
+            "repo": self.repo_full_name,
+            "base_commit": parent_sha,
+            "problem_statement": problem_statement,
+            "hints_text": hints_text, 
+            "created_at": created_at,
+            "patch": gold_patch,
+            "test_patch": test_patch,
+            "version": version,
+            "environment_setup_commit": parent_sha,
+        }, test_files
+
+    def _build_image(self, commit_sha, mode, inject_tests_from=None, test_paths=None, commit_msg=""):
         instance_id = f"r2e-{commit_sha[:8]}-{mode}"
         build_dir = f"temp_{instance_id}"
         
-        if os.path.exists(build_dir):
-            shutil.rmtree(build_dir, ignore_errors=True)
-
+        shutil.rmtree(build_dir, ignore_errors=True)
         subprocess.run(["git", "clone", self.repo_path, build_dir], check=True)
         subprocess.run(["git", "-C", build_dir, "checkout", "-f", commit_sha], check=True)
 
         if inject_tests_from and test_paths:
-            print(f"  [Inject] 正在注入测试文件到 {mode} 环境...")
             for tp in test_paths:
                 subprocess.run(["git", "-C", build_dir, "checkout", inject_tests_from, "--", tp], check=False)
 
         problem_statement = "No description generated."
         if mode == "pre-fix":
-            print(f"  [LLM] 正在反向生成任务书...")
             diff_content = subprocess.check_output(["git", "-C", self.repo_path, "show", inject_tests_from]).decode('utf-8', 'ignore')
-            commit_msg = subprocess.check_output(["git", "-C", self.repo_path, "log", "-1", "--pretty=%B", inject_tests_from]).decode('utf-8', 'ignore')
             problem_statement = self.translator.generate_issue_description(commit_msg, diff_content)
 
         with open(os.path.join(build_dir, "INSTRUCTION.md"), "w", encoding="utf-8") as f:
-            f.write(f"# R2E Task: {instance_id}\n\n## 任务描述\n{problem_statement}\n\n---\n**目标**：修复问题。")
+            f.write(f"## 任务描述\n{problem_statement}")
 
-        dockerfile_content = f"""
-FROM swe-base-test
+        # 引入 uv 加速构建，适合在云服务器环境中进行快速隔离验证
+        dockerfile_content = """FROM python:3.9-slim
+RUN pip install uv pytest
 COPY . /testbed
-RUN echo 'alias hint="cat /testbed/INSTRUCTION.md"' >> ~/.bashrc
-RUN /usr/local/bin/setup_env.sh || echo "Environment setup skipped"
+WORKDIR /testbed
+RUN uv pip install --system -e . || echo 'install skipped'
 """
         with open(os.path.join(build_dir, "Dockerfile.task"), "w") as f:
             f.write(dockerfile_content)
 
-        print(f"--- 正在构建 {mode} 镜像: {instance_id} ---")
-        client.images.build(path=build_dir, dockerfile="Dockerfile.task", tag=instance_id, rm=True)
-        shutil.rmtree(build_dir, ignore_errors=True) # 构建完立即清理占用空间
+        self.client.images.build(path=build_dir, dockerfile="Dockerfile.task", tag=instance_id, rm=True)
+        shutil.rmtree(build_dir, ignore_errors=True)
+        return problem_statement
 
-# --- 验证逻辑 (保持原有接口) ---
 class R2EValidator:
     def __init__(self):
         self.client = docker.from_env()
 
-    def validate_instance(self, pre_fix_tag, post_fix_tag, test_cmd="pytest"):
-        print(f"--- [Validation] 正在验证: {pre_fix_tag} ---")
-        pre_status = self._run_test(pre_fix_tag, test_cmd)
-        post_status = self._run_test(post_fix_tag, test_cmd)
+    def _parse_pytest_output(self, output):
+        """精准提取 pytest 的 node IDs"""
+        passed, failed = set(), set()
+        for line in output.split('\n'):
+            match = re.search(r'^(.*?\.py::.*?)\s+(PASSED|FAILED)', line)
+            if match:
+                node_id, status = match.groups()
+                if status == 'PASSED':
+                    passed.add(node_id)
+                else:
+                    failed.add(node_id)
+        return passed, failed
+
+    def validate_and_extract(self, pre_tag, post_tag, test_files):
+        print(f"--- [Validation] 正在执行严格的 F2P & P2P 验证 ---")
+        test_cmd = f"pytest -v {' '.join(test_files)}"
         
-        if pre_status != 0 and post_status == 0:
-            print("🎉 验证成功！符合 F2P (Fail to Pass) 规范。")
-            return True
-        else:
-            print(f"❌ 验证失败 (Pre:{pre_status}, Post:{post_status})")
-            return False
+        pre_code, pre_out = self._run_test(pre_tag, test_cmd)
+        post_code, post_out = self._run_test(post_tag, test_cmd)
+        
+        pre_pass, pre_fail = self._parse_pytest_output(pre_out)
+        post_pass, post_fail = self._parse_pytest_output(post_out)
+
+        # 严格集合运算：
+        # FAIL_TO_PASS: 之前失败，现在通过
+        fail_to_pass = list(pre_fail.intersection(post_pass))
+        # PASS_TO_PASS: 之前通过，现在依然通过
+        pass_to_pass = list(pre_pass.intersection(post_pass))
+
+        is_valid = len(fail_to_pass) > 0  # 必须至少修复了一个用例
+        return is_valid, fail_to_pass, pass_to_pass
 
     def _run_test(self, image_tag, test_cmd):
         try:
             container = self.client.containers.run(
                 image_tag,
-                command=f"bash -c 'source /opt/conda/bin/activate base && {test_cmd}'",
-                detach=True,
-                working_dir="/testbed"
+                command=f"bash -c '{test_cmd}'",
+                detach=True, working_dir="/testbed"
             )
             result = container.wait(timeout=300)
+            output = container.logs().decode('utf-8', 'ignore')
             container.remove()
-            return result['StatusCode']
-        except:
-            return -1
+            return result['StatusCode'], output
+        except Exception as e:
+            return -1, str(e)
 
-# --- 主程序 (逻辑升级：全网发现) ---
+def update_registry(instance_id, image_tag):
+    """更新 Docker 环境注册表"""
+    registry = {}
+    if os.path.exists(REGISTRY_FILE):
+        with open(REGISTRY_FILE, 'r') as f:
+            registry = json.load(f)
+    registry[instance_id] = image_tag
+    with open(REGISTRY_FILE, 'w') as f:
+        json.dump(registry, f, indent=4)
+
 if __name__ == "__main__":
-    # 1. 发现高质量项目
-    discovery = GitHubDiscovery(token=GITHUB_TOKEN)
-    target_repos = discovery.get_high_quality_repos(lang="python", min_stars=1000, limit=3)
-    
+    os.makedirs(DATA_DIR, exist_ok=True)
+    github_api = GitHubDiscovery(token=GITHUB_TOKEN)
+    target_repos = github_api.get_high_quality_repos(limit=2)
     validator = R2EValidator()
-    
+    client = docker.from_env()
+
     for repo_url in target_repos:
         repo_name = repo_url.split("/")[-1].replace(".git", "")
         local_path = f"./source_{repo_name}"
         
         try:
-            builder = R2EBuilder(repo_url, local_path)
-            # 从每个仓库里找 1 个最典型的 Bug Fix Commit
+            builder = R2EBuilder(repo_url, local_path, github_api)
             eligible_tasks = builder.find_eligible_commits(limit=1)
             
             for task in eligible_tasks:
-                builder.build_pair(task)
+                instance_data, test_files = builder.build_pair(task)
                 
                 pre_tag = f"r2e-{task['sha'][:8]}-pre-fix"
                 post_tag = f"r2e-{task['sha'][:8]}-post-fix"
                 
-                if validator.validate_instance(pre_tag, post_tag):
-                    print(f"✅ 任务保存: {pre_tag}")
+                success, f2p, p2p = validator.validate_and_extract(pre_tag, post_tag, test_files)
+                
+                if success:
+                    instance_data["FAIL_TO_PASS"] = json.dumps(f2p)
+                    instance_data["PASS_TO_PASS"] = json.dumps(p2p)
+                    
+                    with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(instance_data, ensure_ascii=False) + "\n")
+                    
+                    # 写入注册表，绑定实例 ID 与修复前的测试环境
+                    update_registry(instance_data["instance_id"], pre_tag)
+                    
+                    print(f"✅ 生产级任务已生成: {instance_data['instance_id']}")
+                    # 清理无用的 post-fix 镜像释放服务器空间
+                    client.images.remove(post_tag, force=True)
                 else:
-                    print(f"🗑️ 清理无效镜像: {pre_tag}")
-                    try:
-                        client.images.remove(pre_tag, force=True)
-                        client.images.remove(post_tag, force=True)
-                    except: pass
+                    print(f"🗑️ 验证未通过 (未检测到有效修复)，清理现场: {pre_tag}")
+                    client.images.remove(pre_tag, force=True)
+                    client.images.remove(post_tag, force=True)
             
-            # 清理源码节省空间
             shutil.rmtree(local_path, ignore_errors=True)
-            
         except Exception as e:
-            print(f"处理仓库 {repo_url} 时出错: {e}")
+            print(f"Error processing {repo_url}: {e}")
             continue

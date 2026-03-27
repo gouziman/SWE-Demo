@@ -22,6 +22,35 @@ class ContainerSession:
         if not os.path.exists(self.log_dir):
             os.makedirs(self.log_dir)
         
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        
         # 生成结构化的日志文件名
         image_name_clean = self.image_name.replace('/', '_').replace(':', '_')
         self.log_file = os.path.join(self.log_dir, f"agent_{image_name_clean}_{self.session_id}.json")
